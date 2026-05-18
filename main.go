@@ -2,11 +2,9 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"github.com/google/uuid"
 	"log"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 )
@@ -30,6 +28,7 @@ var ch chan job
 var mut sync.Mutex
 
 func main() {
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	ch = make(chan job, 100)
 	go initScheduler()
 	for i := 0; i < 3; i++ {
@@ -63,20 +62,20 @@ func createJob(w http.ResponseWriter, r *http.Request) {
 	ch <- j
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(j)
-	fmt.Fprintf(os.Stdout, "[%s] Job {%v}\n", time.Now().Format("15:04:05.000"), j)
+	log.Printf("Job {%v}\n", j)
 }
 
 func getJob(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(os.Stdout, "List of jobs:\n")
+	log.Printf("List of jobs:\n")
 	for i, job := range jobs {
-		fmt.Fprintf(os.Stdout, "[%d] - %v\n", i, job)
+		log.Printf("[%d] - %v\n", i, job)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(jobs)
 }
 
 func initWorker(workerId int) {
-	fmt.Fprintf(os.Stdout, "[%s] Worker Initialzied %d\n", time.Now().Format("15:04:05.000"), workerId)
+	log.Printf("Worker Initialzied %d\n", workerId)
 
 	for j := range ch {
 		mut.Lock()
@@ -84,9 +83,9 @@ func initWorker(workerId int) {
 			if jobs[job].UID == j.UID {
 				mut.Unlock()
 				//TODO: Processing something
-				fmt.Printf("[%s] job processing\n", time.Now().Format("15:04:05.000"))
+				log.Printf("job processing\n")
 				time.Sleep(10 * time.Second)
-				fmt.Printf("[%s] job processed\n", time.Now().Format("15:04:05.000"))
+				log.Printf("job processed\n")
 				break
 			}
 		}
@@ -94,22 +93,21 @@ func initWorker(workerId int) {
 }
 
 func initScheduler() {
-	fmt.Fprintf(os.Stdout, "[%s] Initialized the scheduler\n", time.Now().Format("15:04:05.000"))
+	log.Printf("Initialized the scheduler\n")
 	ticker := time.NewTicker(1 * time.Second)
 	for range ticker.C {
 		mut.Lock()
 		for job := range jobs {
 			if jobs[job].NextExecution.Before(time.Now()) {
-				fmt.Fprintf(
-					os.Stdout,
-					"[%s] Found job %s which needs to trigger at %v\n",
-					time.Now().Format("15:04:05.000"), jobs[job].Name, jobs[job].NextExecution
+				log.Printf(
+					"Found job %s which needs to trigger at %v\n",
+					jobs[job].Name, jobs[job].NextExecution,
 				)
-				
+
 				jobs[job].NextExecution = time.Now().Add(
-					time.Duration(jobs[job].Interval_s) * time.Second
+					time.Duration(jobs[job].Interval_s) * time.Second,
 				)
-				
+
 				jobs[job].LastRunTime = time.Now()
 				ch <- jobs[job]
 			}
