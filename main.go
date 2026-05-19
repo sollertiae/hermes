@@ -23,6 +23,10 @@ type createJobRequest struct {
 	Interval_s int
 }
 
+type deleteJobRequest struct {
+	UID string
+}
+
 var jobs []job
 var ch chan job
 var mut sync.Mutex
@@ -37,6 +41,7 @@ func main() {
 
 	http.HandleFunc("/job", createJob)
 	http.HandleFunc("/jobs", getJob)
+	http.HandleFunc("/delete", deleteJob)
 	log.Fatal(http.ListenAndServe("localhost:8000", nil))
 }
 
@@ -72,6 +77,27 @@ func getJob(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(jobs)
+}
+
+func deleteJob(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var req deleteJobRequest
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	mut.Lock()
+	for job := range jobs {
+		if jobs[job].UID == req.UID {
+			log.Printf("Removing the job %s\n", req.UID)
+			jobs = append(jobs[:job], jobs[job+1:]...)
+			break
+		}
+	}
+	mut.Unlock()
+	w.WriteHeader(http.StatusOK)
 }
 
 func initWorker(workerId int) {
