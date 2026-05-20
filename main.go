@@ -27,6 +27,13 @@ type deleteJobRequest struct {
 	UID string
 }
 
+type updateJobRequest struct {
+	UID        string
+	Name       string
+	Interval_s int
+	Status     string
+}
+
 var jobs []job
 var ch chan job
 var mut sync.Mutex
@@ -42,6 +49,7 @@ func main() {
 	http.HandleFunc("/job", createJob)
 	http.HandleFunc("/jobs", getJob)
 	http.HandleFunc("/delete", deleteJob)
+	http.HandleFunc("/update", updateJob)
 	log.Fatal(http.ListenAndServe("localhost:8000", nil))
 }
 
@@ -82,6 +90,7 @@ func getJob(w http.ResponseWriter, r *http.Request) {
 func deleteJob(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	var req deleteJobRequest
+	found := false
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -91,12 +100,57 @@ func deleteJob(w http.ResponseWriter, r *http.Request) {
 	mut.Lock()
 	for job := range jobs {
 		if jobs[job].UID == req.UID {
+			found = true
 			log.Printf("Removing the job %s\n", req.UID)
 			jobs = append(jobs[:job], jobs[job+1:]...)
 			break
 		}
 	}
 	mut.Unlock()
+
+	if !found {
+		http.Error(w, "job not found", http.StatusNotFound)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func updateJob(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var req updateJobRequest
+	found := false
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	mut.Lock()
+	for job := range jobs {
+		if jobs[job].UID == req.UID {
+			log.Printf(
+				"Updating the job %s [Name: %s, Interval: %d, Status: %s]\n",
+				req.UID, req.Name, req.Interval_s, req.Status,
+			)
+			found = true
+			if req.Name != "" {
+				jobs[job].Name = req.Name
+			}
+			if req.Interval_s != 0 {
+				jobs[job].Interval_s = req.Interval_s
+				jobs[job].NextExecution = time.Now().Add(time.Duration(req.Interval_s) * time.Second)
+			}
+			if req.Status != "" {
+				jobs[job].Status = req.Status
+			}
+			break
+		}
+	}
+	mut.Unlock()
+	if !found {
+		http.Error(w, "job not found", http.StatusNotFound)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
