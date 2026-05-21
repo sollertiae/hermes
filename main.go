@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"log"
 	"net/http"
 	"sync"
@@ -37,9 +39,18 @@ type updateJobRequest struct {
 var jobs []job
 var ch chan job
 var mut sync.Mutex
+var rdb *redis.Client
+var ctx = context.Background()
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
+
+	rdb = redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+
+	initJobs()
+
 	ch = make(chan job, 100)
 	go initScheduler()
 	for i := 0; i < 3; i++ {
@@ -75,6 +86,7 @@ func createJob(w http.ResponseWriter, r *http.Request) {
 	ch <- j
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(j)
+	exportJobs()
 	log.Printf("Job {%v}\n", j)
 }
 
@@ -113,6 +125,7 @@ func deleteJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	exportJobs()
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -151,6 +164,7 @@ func updateJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "job not found", http.StatusNotFound)
 		return
 	}
+	exportJobs()
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -194,4 +208,23 @@ func initScheduler() {
 		}
 		mut.Unlock()
 	}
+}
+
+func exportJobs() {
+	mut.Lock()
+	data, _ := json.Marshal(jobs)
+	mut.Unlock()
+	rdb.Set(ctx, "jobs", data, 0)
+}
+
+func initJobs() {
+	data, err := rdb.Get(ctx, "jobs").Bytes()
+	if err != nil {
+		log.Printf("No jobs found in redis")
+		return
+	}
+	mut.Lock()
+	json.Unmarshal(data, &jobs)
+	mut.Unlock()
+	log.Printf("Loaded %d jobs from Redis", len(jobs))
 }
