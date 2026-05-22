@@ -11,18 +11,25 @@ import (
 	"time"
 )
 
+const (
+	jobTypeHTTP   = "http"
+	jobTypeScript = "script"
+)
+
 type job struct {
 	UID           string
 	Name          string
 	Interval_s    int
 	LastRunTime   time.Time
 	NextExecution time.Time
+	Type          string
 	Status        string
 }
 
 type createJobRequest struct {
 	Name       string
 	Interval_s int
+	Type       string
 }
 
 type deleteJobRequest struct {
@@ -80,6 +87,7 @@ func createJob(w http.ResponseWriter, r *http.Request) {
 		LastRunTime:   time.Time{},
 		NextExecution: time.Now().Add(time.Duration(req.Interval_s) * time.Second),
 		Status:        "active",
+		Type:          req.Type,
 	}
 
 	jobs = append(jobs, j)
@@ -175,14 +183,17 @@ func initWorker(workerId int) {
 		mut.Lock()
 		for job := range jobs {
 			if jobs[job].UID == j.UID {
-				mut.Unlock()
-				//TODO: Processing something
-				log.Printf("job processing\n")
-				time.Sleep(10 * time.Second)
-				log.Printf("job processed\n")
-				break
+				switch jobs[job].Type {
+				case jobTypeHTTP:
+					executeHTTP(jobs[job])
+				case jobTypeScript:
+					//TODO: Add different job types
+				default:
+					log.Printf("%s job type does not exist", j.Type)
+				}
 			}
 		}
+		mut.Unlock()
 	}
 }
 
@@ -227,4 +238,19 @@ func initJobs() {
 	json.Unmarshal(data, &jobs)
 	mut.Unlock()
 	log.Printf("Loaded %d jobs from Redis", len(jobs))
+}
+
+func executeHTTP(j job) {
+	start := time.Now()
+	//TODO: Create payloads for job type
+	resp, err := http.Get("https://github.com/sollertiae")
+	duration := time.Since(start)
+
+	if err != nil {
+		log.Printf("HTTP job %s failed %v", j.Name, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	log.Printf("HTTP job %s: %d in %v", j.Name, resp.StatusCode, duration)
 }
