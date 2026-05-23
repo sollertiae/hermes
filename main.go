@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"github.com/robfig/cron/v3"
 	"log"
 	"net/http"
 	"sync"
@@ -20,7 +22,7 @@ const (
 type job struct {
 	UID           string
 	Name          string
-	Interval_s    int
+	Cron          string
 	LastRunTime   time.Time
 	NextExecution time.Time
 	Type          string
@@ -29,10 +31,10 @@ type job struct {
 }
 
 type createJobRequest struct {
-	Name       string
-	Interval_s int
-	Type       string
-	Payload    json.RawMessage
+	Name    string
+	Cron    string
+	Type    string
+	Payload json.RawMessage
 }
 
 type deleteJobRequest struct {
@@ -40,16 +42,17 @@ type deleteJobRequest struct {
 }
 
 type updateJobRequest struct {
-	UID        string
-	Name       string
-	Interval_s int
-	Payload    json.RawMessage
-	Status     string
+	UID     string
+	Name    string
+	Cron    string
+	Payload json.RawMessage
+	Status  string
 }
 
 type payloadHTTP struct {
-	URL    string
-	Method string
+	URL     string
+	Method  string
+	Timeout int
 }
 
 var jobs []job
@@ -57,6 +60,7 @@ var ch chan job
 var mut sync.Mutex
 var rdb *redis.Client
 var ctx = context.Background()
+var c = cron.New()
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
@@ -92,20 +96,26 @@ func createJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	schedule, err := cron.ParseStandard(req.Cron)
+
+	if err != nil {
+		http.Error(w, "invalid cron expression", http.StatusBadRequest)
+		return
+	}
 
 	j := job{
 		UID:           uuid.New().String(),
 		Name:          req.Name,
-		Interval_s:    req.Interval_s,
+		Cron:          req.Cron,
 		LastRunTime:   time.Time{},
-		NextExecution: time.Now().Add(time.Duration(req.Interval_s) * time.Second),
+		NextExecution: schedule.Next(time.Now()),
 		Type:          req.Type,
 		Payload:       req.Payload,
 		Status:        "active",
 	}
 
 	jobs = append(jobs, j)
-	ch <- j
+	c.AddFunc(req.Cron, func() { ch <- j })
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(j)
 	exportJobs()
@@ -113,10 +123,6 @@ func createJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func getJob(w http.ResponseWriter, r *http.Request) {
-	log.Printf("List of jobs:\n")
-	for i, job := range jobs {
-		log.Printf("[%d] - %v\n", i, job)
-	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(jobs)
 }
@@ -164,16 +170,20 @@ func updateJob(w http.ResponseWriter, r *http.Request) {
 	for job := range jobs {
 		if jobs[job].UID == req.UID {
 			log.Printf(
-				"Updating the job %s [Name: %s, Interval: %d, Status: %s]\n",
-				req.UID, req.Name, req.Interval_s, req.Status,
+				"Updating the job %s [Name: %s, Interval: %s, Status: %s]\n",
+				req.UID, req.Name, req.Cron, req.Status,
 			)
 			found = true
 			if req.Name != "" {
 				jobs[job].Name = req.Name
 			}
-			if req.Interval_s != 0 {
-				jobs[job].Interval_s = req.Interval_s
-				jobs[job].NextExecution = time.Now().Add(time.Duration(req.Interval_s) * time.Second)
+			if req.Cron != "" {
+				jobs[job].Cron = req.Cron
+				schedule, err := cron.ParseStandard(req.Cron)
+				if err != nil {
+					log.Printf("error parsing cron expression")
+				}
+				jobs[job].NextExecution = schedule.Next(time.Now())
 			}
 			if req.Status != "" {
 				jobs[job].Status = req.Status
@@ -198,44 +208,30 @@ func initWorker(workerId int) {
 
 	for j := range ch {
 		mut.Lock()
+		var toExecute job
 		for job := range jobs {
 			if jobs[job].UID == j.UID {
-				switch jobs[job].Type {
-				case jobTypeHTTP:
-					executeHTTP(jobs[job])
-				case jobTypeScript:
-					//TODO: Add different job types
-				default:
-					log.Printf("%s job type does not exist", j.Type)
-				}
+				toExecute = jobs[job]
+				jobs[job].LastRunTime = time.Now()
+				break
 			}
 		}
 		mut.Unlock()
+		exportJobs()
+		switch toExecute.Type {
+		case jobTypeHTTP:
+			executeHTTP(toExecute, workerId)
+		case jobTypeScript:
+			//TODO: Add different job types
+		default:
+			log.Printf("%s job type does not exist", j.Type)
+		}
 	}
 }
 
 func initScheduler() {
 	log.Printf("Initialized the scheduler\n")
-	ticker := time.NewTicker(1 * time.Second)
-	for range ticker.C {
-		mut.Lock()
-		for job := range jobs {
-			if jobs[job].NextExecution.Before(time.Now()) {
-				log.Printf(
-					"Found job %s which needs to trigger at %v\n",
-					jobs[job].Name, jobs[job].NextExecution,
-				)
-
-				jobs[job].NextExecution = time.Now().Add(
-					time.Duration(jobs[job].Interval_s) * time.Second,
-				)
-
-				jobs[job].LastRunTime = time.Now()
-				ch <- jobs[job]
-			}
-		}
-		mut.Unlock()
-	}
+	c.Start()
 }
 
 func exportJobs() {
@@ -254,16 +250,27 @@ func initJobs() {
 	mut.Lock()
 	json.Unmarshal(data, &jobs)
 	mut.Unlock()
+
+	for _, j := range jobs {
+		job := j
+		c.AddFunc(j.Cron, func() { ch <- job })
+	}
+
 	log.Printf("Loaded %d jobs from Redis", len(jobs))
 }
 
-func executeHTTP(j job) {
+func executeHTTP(j job, workerId int) {
 	var payload payloadHTTP
 
 	if err := json.Unmarshal(j.Payload, &payload); err != nil {
 		log.Printf("error decoding payload: %v", err)
 		return
 	}
+
+	if payload.Timeout == 0 {
+		payload.Timeout = 30
+	}
+
 	start := time.Now()
 	req, err := http.NewRequest(payload.Method, payload.URL, nil)
 
@@ -272,16 +279,22 @@ func executeHTTP(j job) {
 		return
 	}
 
-	client := &http.Client{}
+	client := &http.Client{
+		Timeout: time.Duration(payload.Timeout) * time.Second,
+	}
 	resp, err := client.Do(req)
 
 	if err != nil {
-		log.Printf("could not complete the request: %v", err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			log.Printf("request %s timed out", payload.URL)
+		} else {
+			log.Printf("could not complete the request: %v", err)
+		}
 		return
 	}
 
 	duration := time.Since(start)
 
 	defer resp.Body.Close()
-	log.Printf("HTTP job %s: %d in %v", j.Name, resp.StatusCode, duration)
+	log.Printf("[%d] HTTP job %s: %d in %v", workerId, j.Name, resp.StatusCode, duration)
 }
