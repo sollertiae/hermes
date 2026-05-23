@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"log"
@@ -23,6 +24,7 @@ type job struct {
 	LastRunTime   time.Time
 	NextExecution time.Time
 	Type          string
+	Payload       json.RawMessage
 	Status        string
 }
 
@@ -30,6 +32,7 @@ type createJobRequest struct {
 	Name       string
 	Interval_s int
 	Type       string
+	Payload    json.RawMessage
 }
 
 type deleteJobRequest struct {
@@ -40,7 +43,13 @@ type updateJobRequest struct {
 	UID        string
 	Name       string
 	Interval_s int
+	Payload    json.RawMessage
 	Status     string
+}
+
+type payloadHTTP struct {
+	URL    string
+	Method string
 }
 
 var jobs []job
@@ -59,8 +68,12 @@ func main() {
 	initJobs()
 
 	ch = make(chan job, 100)
+
+	numWorkers := flag.Int("workers", 3, "number of workers")
+	flag.Parse()
+
 	go initScheduler()
-	for i := 0; i < 3; i++ {
+	for i := 0; i < *numWorkers; i++ {
 		go initWorker(i)
 	}
 
@@ -86,8 +99,9 @@ func createJob(w http.ResponseWriter, r *http.Request) {
 		Interval_s:    req.Interval_s,
 		LastRunTime:   time.Time{},
 		NextExecution: time.Now().Add(time.Duration(req.Interval_s) * time.Second),
-		Status:        "active",
 		Type:          req.Type,
+		Payload:       req.Payload,
+		Status:        "active",
 	}
 
 	jobs = append(jobs, j)
@@ -163,6 +177,9 @@ func updateJob(w http.ResponseWriter, r *http.Request) {
 			}
 			if req.Status != "" {
 				jobs[job].Status = req.Status
+			}
+			if req.Payload != nil {
+				jobs[job].Payload = req.Payload
 			}
 			break
 		}
@@ -241,16 +258,30 @@ func initJobs() {
 }
 
 func executeHTTP(j job) {
-	start := time.Now()
-	//TODO: Create payloads for job type
-	resp, err := http.Get("https://github.com/sollertiae")
-	duration := time.Since(start)
+	var payload payloadHTTP
 
-	if err != nil {
-		log.Printf("HTTP job %s failed %v", j.Name, err)
+	if err := json.Unmarshal(j.Payload, &payload); err != nil {
+		log.Printf("error decoding payload: %v", err)
 		return
 	}
-	defer resp.Body.Close()
+	start := time.Now()
+	req, err := http.NewRequest(payload.Method, payload.URL, nil)
 
+	if err != nil {
+		log.Printf("could not create the request: %v", err)
+		return
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+
+	if err != nil {
+		log.Printf("could not complete the request: %v", err)
+		return
+	}
+
+	duration := time.Since(start)
+
+	defer resp.Body.Close()
 	log.Printf("HTTP job %s: %d in %v", j.Name, resp.StatusCode, duration)
 }
