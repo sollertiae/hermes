@@ -10,6 +10,7 @@ import (
 	"github.com/robfig/cron/v3"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -64,9 +65,9 @@ var c = cron.New()
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
-
+	redisAddr := os.Getenv("REDIS_ADDR")
 	rdb = redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		Addr: redisAddr,
 	})
 
 	initJobs()
@@ -85,7 +86,7 @@ func main() {
 	http.HandleFunc("/jobs", getJob)
 	http.HandleFunc("/delete", deleteJob)
 	http.HandleFunc("/update", updateJob)
-	log.Fatal(http.ListenAndServe("localhost:8000", nil))
+	log.Fatal(http.ListenAndServe("0.0.0.0:8000", nil))
 }
 
 func createJob(w http.ResponseWriter, r *http.Request) {
@@ -253,7 +254,9 @@ func initJobs() {
 
 	for _, j := range jobs {
 		job := j
-		c.AddFunc(j.Cron, func() { ch <- job })
+		if j.Status == "active" {
+			c.AddFunc(j.Cron, func() { ch <- job })
+		}
 	}
 
 	log.Printf("Loaded %d jobs from Redis", len(jobs))
