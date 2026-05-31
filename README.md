@@ -28,7 +28,7 @@ to ensure updates and deletions remove stale scheduler registrations from the ch
 | GET | /jobs | List all jobs |
 | POST | /update | Update a job |
 | POST | /delete | Delete a job |
-| GET | /executions/<uid> | Get execution history for a job |
+| GET | /executions/uid | Get execution history for a job |
 
 ## Configuration
 
