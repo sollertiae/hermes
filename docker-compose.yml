@@ -15,6 +15,7 @@ services:
       - redis
     environment:
       - REDIS_ADDR=redis:6379
+      - MAX_EXECUTION_HISTORY=99
     command: ["./hermes", "-workers", "3"]
 volumes:
   redis_data:

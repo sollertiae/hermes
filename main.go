@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -29,6 +30,7 @@ type job struct {
 	Type          string
 	Payload       json.RawMessage
 	Status        string
+	EntryID       cron.EntryID
 }
 
 type createJobRequest struct {
@@ -56,15 +58,38 @@ type payloadHTTP struct {
 	Timeout int
 }
 
+type jobExecution struct {
+	UID        string
+	JobID      string
+	ExecutedAt time.Time
+	Duration   time.Duration
+	StatusCode int
+	Success    bool
+	Error      string
+}
+
 var jobs []job
 var ch chan job
 var mut sync.Mutex
 var rdb *redis.Client
 var ctx = context.Background()
 var c = cron.New()
+var maxExecutionHistory int64
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	maxHistory := os.Getenv("MAX_EXECUTION_HISTORY")
+	if maxHistory == "" {
+		maxExecutionHistory = 99
+	} else {
+		val, err := strconv.ParseInt(maxHistory, 10, 64)
+		if err != nil {
+			log.Printf("invalid MAX_EXECUTION_HISTORY, defaulting to 99")
+			maxExecutionHistory = 99
+		} else {
+			maxExecutionHistory = val
+		}
+	}
 	redisAddr := os.Getenv("REDIS_ADDR")
 	rdb = redis.NewClient(&redis.Options{
 		Addr: redisAddr,
@@ -86,6 +111,7 @@ func main() {
 	http.HandleFunc("/jobs", getJob)
 	http.HandleFunc("/delete", deleteJob)
 	http.HandleFunc("/update", updateJob)
+	http.HandleFunc("/executions/", getHistoryJob)
 	log.Fatal(http.ListenAndServe("0.0.0.0:8000", nil))
 }
 
@@ -115,8 +141,9 @@ func createJob(w http.ResponseWriter, r *http.Request) {
 		Status:        "active",
 	}
 
+	entryID, _ := c.AddFunc(req.Cron, func() { ch <- j })
+	j.EntryID = entryID
 	jobs = append(jobs, j)
-	c.AddFunc(req.Cron, func() { ch <- j })
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(j)
 	exportJobs()
@@ -126,6 +153,28 @@ func createJob(w http.ResponseWriter, r *http.Request) {
 func getJob(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(jobs)
+}
+
+func getHistoryJob(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	uid := r.URL.Path[len("/executions/"):]
+	if uid == "" {
+		http.Error(w, "missing job uid", http.StatusBadRequest)
+		return
+	}
+	data, err := rdb.LRange(ctx, "executions:"+uid, 0, -1).Result()
+	if err != nil {
+		http.Error(w, "couldn't fetch executions", http.StatusInternalServerError)
+		return
+	}
+	var executions []jobExecution
+
+	for _, d := range data {
+		var e jobExecution
+		json.Unmarshal([]byte(d), &e)
+		executions = append(executions, e)
+	}
+	json.NewEncoder(w).Encode(executions)
 }
 
 func deleteJob(w http.ResponseWriter, r *http.Request) {
@@ -143,6 +192,7 @@ func deleteJob(w http.ResponseWriter, r *http.Request) {
 		if jobs[job].UID == req.UID {
 			found = true
 			log.Printf("Removing the job %s\n", req.UID)
+			c.Remove(jobs[job].EntryID)
 			jobs = append(jobs[:job], jobs[job+1:]...)
 			break
 		}
@@ -179,6 +229,9 @@ func updateJob(w http.ResponseWriter, r *http.Request) {
 				jobs[job].Name = req.Name
 			}
 			if req.Cron != "" {
+				c.Remove(jobs[job].EntryID)
+				newEntryID, _ := c.AddFunc(req.Cron, func() { ch <- jobs[job] })
+				jobs[job].EntryID = newEntryID
 				jobs[job].Cron = req.Cron
 				schedule, err := cron.ParseStandard(req.Cron)
 				if err != nil {
@@ -252,10 +305,11 @@ func initJobs() {
 	json.Unmarshal(data, &jobs)
 	mut.Unlock()
 
-	for _, j := range jobs {
-		job := j
-		if j.Status == "active" {
-			c.AddFunc(j.Cron, func() { ch <- job })
+	for i := range jobs {
+		if jobs[i].Status == "active" {
+			job := jobs[i]
+			entryID, _ := c.AddFunc(jobs[i].Cron, func() { ch <- job })
+			jobs[i].EntryID = entryID
 		}
 	}
 
@@ -297,6 +351,19 @@ func executeHTTP(j job, workerId int) {
 	}
 
 	duration := time.Since(start)
+
+	execution := jobExecution{
+		UID:        uuid.New().String(),
+		JobID:      j.UID,
+		ExecutedAt: start,
+		Duration:   duration,
+		StatusCode: resp.StatusCode,
+		Success:    resp.StatusCode >= 200 && resp.StatusCode < 300,
+	}
+
+	data, _ := json.Marshal(execution)
+	rdb.LPush(ctx, "executions:"+j.UID, data)
+	rdb.LTrim(ctx, "executions:"+j.UID, 0, maxExecutionHistory)
 
 	defer resp.Body.Close()
 	log.Printf("[%d] HTTP job %s: %d in %v", workerId, j.Name, resp.StatusCode, duration)
